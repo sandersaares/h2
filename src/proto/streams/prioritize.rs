@@ -434,7 +434,8 @@ impl Prioritize {
             additional,
             buffered = stream.buffered_send_data,
             window = stream.send_flow.window_size(),
-            conn = %self.flow.available()
+            conn = %self.flow.available(),
+            is_pending_open = stream.is_pending_open
         );
 
         if additional == 0 {
@@ -454,8 +455,12 @@ impl Prioritize {
         // The amount of currently available capacity on the connection
         let conn_available = self.flow.available().as_size();
 
-        // First check if capacity is immediately available
-        if conn_available > 0 {
+        // First check if capacity is immediately available, if the stream is already open
+        //
+        // We do not assign capacity to streams that are potentially blocked from even
+        // opening due to max concurrency limits, as this would waste the connection
+        // window on streams that could not possibly use it (potentially leading to deadlock).
+        if conn_available > 0 && !stream.is_pending_open {
             // The amount of capacity to assign to the stream
             // TODO: Should prioritization factor into this?
             let assign = cmp::min(conn_available, additional);
@@ -483,7 +488,7 @@ impl Prioritize {
         {
             // The stream requires additional capacity and the stream's
             // window has available capacity, but the connection window
-            // does not.
+            // does not, or the stream is not yet open.
             //
             // In this case, the stream needs to be queued up for when the
             // connection has more capacity.
