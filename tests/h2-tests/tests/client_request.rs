@@ -3,7 +3,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use h2_support::prelude::*;
 use std::pin::Pin;
-use std::task::Context;
+use std::task::{Context, Poll};
 use std::{io, panic};
 
 #[tokio::test]
@@ -1143,6 +1143,113 @@ async fn send_stream_poll_reset() {
             .await
             .unwrap();
         assert_eq!(reason, Reason::REFUSED_STREAM);
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn send_stream_reset_reason() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        srv.send_frame(frames::reset(1).refused()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+
+        let (_response, mut tx) = client.send_request(request, false).unwrap();
+
+        // An open stream has no reset reason to report.
+        assert_eq!(tx.reset_reason().unwrap(), None);
+
+        let reason = conn.drive(poll_fn(|cx| tx.poll_reset(cx))).await.unwrap();
+        assert_eq!(reason, Reason::REFUSED_STREAM);
+
+        // Once reset, the reason is reported without registering for
+        // notification, and repeated calls keep reporting it.
+        assert_eq!(tx.reset_reason().unwrap(), Some(Reason::REFUSED_STREAM));
+        assert_eq!(tx.reset_reason().unwrap(), Some(Reason::REFUSED_STREAM));
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn reset_reason_preserves_capacity_waker() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    // Advertise a zero send window so the client can never obtain capacity and
+    // must park inside `poll_capacity`.
+    let mut settings = frame::Settings::default();
+    settings.set_initial_window_size(Some(0));
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake_with_settings(settings).await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+            .await;
+        idle_ms(100).await;
+        srv.send_frame(frames::reset(1).refused()).await;
+    };
+
+    let client = async move {
+        let (mut client, conn) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+
+        // The connection runs on its own task so that the waiter below is
+        // polled only when its own waker fires, never as a side effect of the
+        // connection making progress.
+        tokio::spawn(async move {
+            conn.await.expect("connection");
+        });
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+
+        let (_response, mut tx) = client.send_request(request, false).unwrap();
+        tx.reserve_capacity(1);
+
+        // Drive the same sequence a body sender uses: consult the reset reason
+        // without registering, then park on capacity. `reset_reason` must leave
+        // the waker installed by `poll_capacity` intact, otherwise the peer's
+        // RST_STREAM would never wake this task and the test would hang.
+        let waiter = tokio::spawn(poll_fn(move |cx| {
+            if let Some(reason) = tx.reset_reason().unwrap() {
+                return Poll::Ready(reason);
+            }
+            assert!(
+                tx.poll_capacity(cx).is_pending(),
+                "a zero send window must never yield capacity"
+            );
+            Poll::Pending
+        }));
+
+        assert_eq!(waiter.await.unwrap(), Reason::REFUSED_STREAM);
+
+        // Hold the client handle open until the waiter resolves so the
+        // connection is not shut down early by a GOAWAY.
+        drop(client);
     };
 
     join(srv, client).await;

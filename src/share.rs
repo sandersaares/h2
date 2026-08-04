@@ -372,6 +372,24 @@ impl<B: Buf> SendStream<B> {
         self.inner.poll_reset(cx, proto::PollReset::Streaming)
     }
 
+    /// Returns the `Reason` this stream was reset with, if it has been reset.
+    ///
+    /// This is the same check [`poll_reset`] performs, without registering the
+    /// current task to be notified when a `RST_STREAM` arrives. Use it when the
+    /// reset state is needed at a point where the caller is not about to
+    /// suspend, so that an existing notification registration is left intact and
+    /// no waker is cloned.
+    ///
+    /// # Error
+    ///
+    /// If connection sees an error, this returns that error instead of a
+    /// `Reason`.
+    ///
+    /// [`poll_reset`]: SendStream::poll_reset
+    pub fn reset_reason(&self) -> Result<Option<Reason>, crate::Error> {
+        self.inner.reset_reason(proto::PollReset::Streaming)
+    }
+
     /// Returns the stream ID of this `SendStream`.
     ///
     /// # Panics

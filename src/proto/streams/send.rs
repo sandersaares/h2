@@ -399,13 +399,22 @@ impl Send {
         stream: &mut Stream,
         mode: PollReset,
     ) -> Poll<Result<Reason, crate::Error>> {
-        match stream.state.ensure_reason(mode)? {
+        match self.reset_reason(stream, mode)? {
             Some(reason) => Poll::Ready(Ok(reason)),
             None => {
                 stream.wait_send(cx);
                 Poll::Pending
             }
         }
+    }
+
+    /// Reads the reset state of the stream without registering for notification.
+    pub fn reset_reason(
+        &self,
+        stream: &Stream,
+        mode: PollReset,
+    ) -> Result<Option<Reason>, crate::Error> {
+        stream.state.ensure_reason(mode)
     }
 
     pub fn recv_connection_window_update(

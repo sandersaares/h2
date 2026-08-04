@@ -1357,6 +1357,19 @@ impl<B> StreamRef<B> {
         me.actions.send.poll_reset(cx, &mut stream, mode)
     }
 
+    /// Reads the reset state of this stream without registering for notification.
+    pub(crate) fn reset_reason(
+        &self,
+        mode: proto::PollReset,
+    ) -> Result<Option<Reason>, crate::Error> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+
+        me.actions.send.reset_reason(&stream, mode)
+    }
+
     pub fn clone_to_opaque(&self) -> OpaqueStreamRef {
         self.opaque.clone()
     }
