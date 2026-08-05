@@ -367,7 +367,7 @@ impl Stream {
     }
 
     pub fn wait_send(&mut self, cx: &Context) {
-        self.send_task = Some(cx.waker().clone());
+        register(&mut self.send_task, cx.waker());
     }
 
     pub fn notify_recv(&mut self) {
@@ -389,6 +389,20 @@ impl Stream {
         self.notify_send();
         self.notify_push();
         self.notify_recv();
+    }
+}
+
+/// Stores `waker` in `slot`, unless a waker that wakes the same task is already
+/// stored there.
+///
+/// A stored waker is consumed when it is woken, so callers must re-register on
+/// every poll to stay reachable. The overwhelmingly common case is a caller
+/// re-registering the same task it registered last time, and comparing is far
+/// cheaper than the clone plus drop that replacing would cost.
+fn register(slot: &mut Option<Waker>, waker: &Waker) {
+    match slot {
+        Some(existing) if existing.will_wake(waker) => {}
+        _ => *slot = Some(waker.clone()),
     }
 }
 
@@ -596,5 +610,90 @@ impl store::Next for NextResetExpire {
 impl ContentLength {
     pub fn is_head(&self) -> bool {
         matches!(*self, Self::Head)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
+
+    /// Waker that records how many times it was cloned and woken.
+    struct CountingWaker {
+        clones: AtomicUsize,
+        wakes: AtomicUsize,
+    }
+
+    impl CountingWaker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                clones: AtomicUsize::new(0),
+                wakes: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Produces a `Waker` and counts that as one clone, mirroring what a caller
+    /// registering into a waker slot costs.
+    fn waker_of(counter: &Arc<CountingWaker>) -> Waker {
+        counter.clones.fetch_add(1, Ordering::Relaxed);
+        Waker::from(Arc::clone(counter))
+    }
+
+    #[test]
+    fn register_stores_the_first_waker() {
+        let counter = CountingWaker::new();
+        let waker = waker_of(&counter);
+
+        let mut slot = None;
+        register(&mut slot, &waker);
+
+        slot.take().expect("waker should be stored").wake();
+        assert_eq!(counter.wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn register_keeps_an_equivalent_waker_without_cloning() {
+        let counter = CountingWaker::new();
+        let waker = waker_of(&counter);
+
+        let mut slot = None;
+        register(&mut slot, &waker);
+        let clones_after_first = counter.clones.load(Ordering::Relaxed);
+
+        // Re-registering the same task must not clone again.
+        register(&mut slot, &waker);
+        register(&mut slot, &waker);
+        assert_eq!(counter.clones.load(Ordering::Relaxed), clones_after_first);
+
+        // The stored waker still reaches the task.
+        slot.take().expect("waker should be stored").wake();
+        assert_eq!(counter.wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn register_replaces_a_waker_for_a_different_task() {
+        let first = CountingWaker::new();
+        let second = CountingWaker::new();
+
+        let mut slot = None;
+        register(&mut slot, &waker_of(&first));
+        register(&mut slot, &waker_of(&second));
+
+        slot.take().expect("waker should be stored").wake();
+        assert_eq!(second.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first.wakes.load(Ordering::Relaxed),
+            0,
+            "the replaced waker must not be woken"
+        );
     }
 }
